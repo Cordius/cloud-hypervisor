@@ -101,7 +101,7 @@ fn main() {
                 .long("memory")
                 .help(
                     "Memory parameters \"size=<guest_memory_size>,\
-                     file=<backing_file_path>\"",
+                     file=<backing_file_path>,mergeable=on|off\"",
                 )
                 .default_value(&default_memory)
                 .group("vm-config"),
@@ -171,7 +171,7 @@ fn main() {
                 .long("pmem")
                 .help(
                     "Persistent memory parameters \"file=<backing_file_path>,\
-                     size=<persistent_memory_size>,iommu=on|off\"",
+                     size=<persistent_memory_size>,iommu=on|off,mergeable=on|off\"",
                 )
                 .takes_value(true)
                 .min_values(1)
@@ -346,7 +346,7 @@ fn main() {
         "Cloud Hypervisor Guest\n\tAPI server: {}\n\tvCPUs: {}\n\tMemory: {} MB\
          \n\tKernel: {:?}\n\tKernel cmdline: {}\n\tDisk(s): {:?}",
         api_socket_path,
-        vm_config.cpus.cpu_count,
+        vm_config.cpus.boot_vcpus,
         vm_config.memory.size >> 20,
         vm_config.kernel,
         vm_config.cmdline.args.as_str(),
@@ -377,7 +377,7 @@ fn main() {
         vmm::api::vm_create(
             api_evt.try_clone().unwrap(),
             api_request_sender,
-            Arc::new(vm_config),
+            Arc::new(Mutex::new(vm_config)),
         )
         .expect("Could not create the VM");
         vmm::api::vm_boot(api_evt.try_clone().unwrap(), sender).expect("Could not boot the VM");
@@ -414,6 +414,8 @@ mod tests {
     #![allow(dead_code)]
     use ssh2::Session;
     use std::fs;
+    use std::io;
+    use std::io::BufRead;
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::process::{Command, Stdio};
@@ -428,10 +430,12 @@ mod tests {
 
     struct GuestNetworkConfig {
         guest_ip: String,
-        l2_guest_ip: String,
+        l2_guest_ip1: String,
+        l2_guest_ip2: String,
         host_ip: String,
         guest_mac: String,
-        l2_guest_mac: String,
+        l2_guest_mac1: String,
+        l2_guest_mac2: String,
     }
 
     struct Guest<'a> {
@@ -456,6 +460,7 @@ mod tests {
         fn disk(&self, disk_type: DiskType) -> Option<String>;
     }
 
+    #[derive(Clone)]
     struct ClearDiskConfig {
         osdisk_path: String,
         osdisk_raw_path: String,
@@ -528,9 +533,13 @@ mod tests {
 
             user_data_string = user_data_string.replace("192.168.2.1", &network.host_ip);
             user_data_string = user_data_string.replace("192.168.2.2", &network.guest_ip);
-            user_data_string = user_data_string.replace("192.168.2.3", &network.l2_guest_ip);
+            user_data_string = user_data_string.replace("192.168.2.3", &network.l2_guest_ip1);
+            user_data_string = user_data_string.replace("192.168.2.4", &network.l2_guest_ip2);
             user_data_string = user_data_string.replace("12:34:56:78:90:ab", &network.guest_mac);
-            user_data_string = user_data_string.replace("de:ad:be:ef:12:34", &network.l2_guest_mac);
+            user_data_string =
+                user_data_string.replace("de:ad:be:ef:12:34", &network.l2_guest_mac1);
+            user_data_string =
+                user_data_string.replace("de:ad:be:ef:34:56", &network.l2_guest_mac2);
 
             fs::File::create(cloud_init_directory.join("latest").join("user_data"))
                 .unwrap()
@@ -706,6 +715,26 @@ mod tests {
         (child, virtiofsd_socket_path)
     }
 
+    fn prepare_vhost_user_fs_daemon(
+        tmp_dir: &TempDir,
+        shared_dir: &str,
+        _cache: &str,
+    ) -> (std::process::Child, String) {
+        let virtiofsd_socket_path =
+            String::from(tmp_dir.path().join("virtiofs.sock").to_str().unwrap());
+
+        // Start the daemon
+        let child = Command::new("target/release/vhost_user_fs")
+            .args(&["--shared-dir", shared_dir])
+            .args(&["--sock", virtiofsd_socket_path.as_str()])
+            .spawn()
+            .unwrap();
+
+        thread::sleep(std::time::Duration::new(10, 0));
+
+        (child, virtiofsd_socket_path)
+    }
+
     fn prepare_vubd(tmp_dir: &TempDir, blk_img: &str) -> (std::process::Child, String) {
         let mut workload_path = dirs::home_dir().unwrap();
         workload_path.push("workloads");
@@ -834,10 +863,12 @@ mod tests {
             let fw_path = String::from(fw_path.to_str().unwrap());
             let network = GuestNetworkConfig {
                 guest_ip: format!("{}.{}.2", class, id),
-                l2_guest_ip: format!("{}.{}.3", class, id),
+                l2_guest_ip1: format!("{}.{}.3", class, id),
+                l2_guest_ip2: format!("{}.{}.4", class, id),
                 host_ip: format!("{}.{}.1", class, id),
                 guest_mac: format!("12:34:56:78:90:{:02x}", id),
-                l2_guest_mac: format!("de:ad:be:ef:12:{:02x}", id),
+                l2_guest_mac1: format!("de:ad:be:ef:12:{:02x}", id),
+                l2_guest_mac2: format!("de:ad:be:ef:34:{:02x}", id),
             };
 
             disk_config.prepare_files(&tmp_dir, &network);
@@ -890,17 +921,27 @@ mod tests {
             )
         }
 
-        fn ssh_command_l2(&self, command: &str) -> Result<String, Error> {
+        fn ssh_command_l2_1(&self, command: &str) -> Result<String, Error> {
             ssh_command_ip(
                 command,
-                &self.network.l2_guest_ip,
+                &self.network.l2_guest_ip1,
+                DEFAULT_SSH_RETRIES,
+                DEFAULT_SSH_TIMEOUT,
+            )
+        }
+
+        fn ssh_command_l2_2(&self, command: &str) -> Result<String, Error> {
+            ssh_command_ip(
+                command,
+                &self.network.l2_guest_ip2,
                 DEFAULT_SSH_RETRIES,
                 DEFAULT_SSH_TIMEOUT,
             )
         }
 
         fn api_create_body(&self, cpu_count: u8) -> String {
-            format! {"{{\"cpus\":{{\"cpu_count\":{}}},\"kernel\":{{\"path\":\"{}\"}},\"cmdline\":{{\"args\": \"\"}},\"net\":[{{\"ip\":\"{}\", \"mask\":\"255.255.255.0\", \"mac\":\"{}\"}}], \"disks\":[{{\"path\":\"{}\"}}, {{\"path\":\"{}\"}}]}}",
+            format! {"{{\"cpus\":{{\"boot_vcpus\":{},\"max_vcpus\":{}}},\"kernel\":{{\"path\":\"{}\"}},\"cmdline\":{{\"args\": \"\"}},\"net\":[{{\"ip\":\"{}\", \"mask\":\"255.255.255.0\", \"mac\":\"{}\"}}], \"disks\":[{{\"path\":\"{}\"}}, {{\"path\":\"{}\"}}]}}",
+                     cpu_count,
                      cpu_count,
                      self.fw_path.as_str(),
                      self.network.host_ip,
@@ -908,6 +949,10 @@ mod tests {
                      self.disk_config.disk(DiskType::OperatingSystem).unwrap().as_str(),
                      self.disk_config.disk(DiskType::CloudInit).unwrap().as_str(),
             }
+        }
+
+        fn api_resize_body(&self, desired_vcpus: u8) -> String {
+            format!("{{\"desired_vcpus\":{}}}", desired_vcpus)
         }
 
         fn get_cpu_count(&self) -> Result<u32, Error> {
@@ -1048,7 +1093,7 @@ mod tests {
                 let guest = Guest::new(*disk_config);
 
                 let mut child = Command::new("target/release/cloud-hypervisor")
-                    .args(&["--cpus", "1"])
+                    .args(&["--cpus", "boot=1"])
                     .args(&["--memory", "size=512M"])
                     .args(&["--kernel", guest.fw_path.as_str()])
                     .args(&[
@@ -1095,10 +1140,10 @@ mod tests {
     #[cfg_attr(not(feature = "mmio"), test)]
     fn test_multi_cpu() {
         test_block!(tb, "", {
-            let mut clear = ClearDiskConfig::new();
-            let guest = Guest::new(&mut clear);
+            let mut bionic = UbuntuDiskConfig::new(BIONIC_IMAGE_NAME.to_string());
+            let guest = Guest::new(&mut bionic);
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "2"])
+                .args(&["--cpus", "boot=2,max=4"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -1122,6 +1167,14 @@ mod tests {
 
             aver_eq!(tb, guest.get_cpu_count().unwrap_or_default(), 2);
 
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command(r#"dmesg | grep "smpboot: Allowing" | sed "s/\[\ *[0-9.]*\] //""#)
+                    .unwrap_or_default()
+                    .trim(),
+                "smpboot: Allowing 4 CPUs, 2 hotplug CPUs"
+            );
             guest.ssh_command("sudo shutdown -h now")?;
             thread::sleep(std::time::Duration::new(10, 0));
             let _ = child.kill();
@@ -1136,7 +1189,7 @@ mod tests {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=5120M"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -1174,7 +1227,7 @@ mod tests {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=128G"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -1215,7 +1268,7 @@ mod tests {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -1268,7 +1321,7 @@ mod tests {
             kernel_path.push("vmlinux");
 
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus","boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .args(&[
@@ -1327,7 +1380,7 @@ mod tests {
             kernel_path.push("bzImage");
 
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus","boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .args(&[
@@ -1394,7 +1447,7 @@ mod tests {
                 .unwrap();
 
             let mut cloud_child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M,file=/dev/shm"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -1456,7 +1509,7 @@ mod tests {
             let (mut daemon_child, vubd_socket_path) = prepare_vubd(&guest.tmp_dir, "blk.img");
 
             let mut cloud_child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M,file=/dev/shm"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -1546,7 +1599,7 @@ mod tests {
             );
 
             let mut cloud_child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M,file=/dev/shm"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -1596,7 +1649,7 @@ mod tests {
             let guest = Guest::new(&mut clear);
 
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -1647,7 +1700,12 @@ mod tests {
         });
     }
 
-    fn test_virtio_fs(dax: bool, cache_size: Option<u64>, virtiofsd_cache: &str) {
+    fn test_virtio_fs(
+        dax: bool,
+        cache_size: Option<u64>,
+        virtiofsd_cache: &str,
+        prepare_daemon: &dyn Fn(&TempDir, &str, &str) -> (std::process::Child, String),
+    ) {
         test_block!(tb, "", {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
@@ -1668,14 +1726,14 @@ mod tests {
                 "".to_string()
             };
 
-            let (mut daemon_child, virtiofsd_socket_path) = prepare_virtiofsd(
+            let (mut daemon_child, virtiofsd_socket_path) = prepare_daemon(
                 &guest.tmp_dir,
                 shared_dir.to_str().unwrap(),
                 virtiofsd_cache,
             );
 
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M,file=/dev/shm"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .args(&[
@@ -1774,17 +1832,22 @@ mod tests {
 
     #[cfg_attr(not(feature = "mmio"), test)]
     fn test_virtio_fs_dax_on_default_cache_size() {
-        test_virtio_fs(true, None, "always")
+        test_virtio_fs(true, None, "always", &prepare_virtiofsd)
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
     fn test_virtio_fs_dax_on_cache_size_1_gib() {
-        test_virtio_fs(true, Some(0x4000_0000), "always")
+        test_virtio_fs(true, Some(0x4000_0000), "always", &prepare_virtiofsd)
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
     fn test_virtio_fs_dax_off() {
-        test_virtio_fs(false, None, "none")
+        test_virtio_fs(false, None, "none", &prepare_virtiofsd)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_virtio_fs_dax_off_w_vhost_user_fs_daemon() {
+        test_virtio_fs(false, None, "none", &prepare_vhost_user_fs_daemon)
     }
 
     #[test]
@@ -1800,7 +1863,7 @@ mod tests {
             kernel_path.push("vmlinux");
 
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus","boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .args(&[
@@ -1863,7 +1926,7 @@ mod tests {
             kernel_path.push("vmlinux");
 
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus","boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .args(&["--disk",
@@ -1907,7 +1970,7 @@ mod tests {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -1960,7 +2023,7 @@ mod tests {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -1995,18 +2058,6 @@ mod tests {
                 0
             );
 
-            // Further test that we're MSI only now
-            aver_eq!(
-                tb,
-                guest
-                    .ssh_command("cat /proc/interrupts | grep -c 'IO-APIC'")
-                    .unwrap_or_default()
-                    .trim()
-                    .parse::<u32>()
-                    .unwrap_or(1),
-                0
-            );
-
             guest.ssh_command("sudo shutdown -h now")?;
             thread::sleep(std::time::Duration::new(10, 0));
             let _ = child.kill();
@@ -2021,7 +2072,7 @@ mod tests {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -2082,7 +2133,7 @@ mod tests {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -2145,7 +2196,7 @@ mod tests {
 
             let serial_path = guest.tmp_dir.path().join("/tmp/serial-output");
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -2208,7 +2259,7 @@ mod tests {
             let guest = Guest::new(&mut clear);
 
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -2268,7 +2319,7 @@ mod tests {
 
             let console_path = guest.tmp_dir.path().join("/tmp/console-output");
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -2350,12 +2401,13 @@ mod tests {
 
             let vfio_tap0 = "vfio-tap0";
             let vfio_tap1 = "vfio-tap1";
+            let vfio_tap2 = "vfio-tap2";
 
             let (mut daemon_child, virtiofsd_socket_path) =
                 prepare_virtiofsd(&guest.tmp_dir, vfio_path.to_str().unwrap(), "always");
 
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "4"])
+                .args(&["--cpus", "boot=4"])
                 .args(&["--memory", "size=1G,file=/dev/shm"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .args(&[
@@ -2379,7 +2431,11 @@ mod tests {
                     )
                     .as_str(),
                     format!(
-                        "tap={},mac={},iommu=on", vfio_tap1, guest.network.l2_guest_mac
+                        "tap={},mac={},iommu=on", vfio_tap1, guest.network.l2_guest_mac1
+                    )
+                    .as_str(),
+                    format!(
+                        "tap={},mac={},iommu=on", vfio_tap2, guest.network.l2_guest_mac2
                     )
                     .as_str(),
                 ])
@@ -2407,7 +2463,7 @@ mod tests {
             aver_eq!(
                 tb,
                 guest
-                    .ssh_command_l2("cat /proc/cmdline | grep -c 'VFIOTAG'")
+                    .ssh_command_l2_1("grep -c VFIOTAG /proc/cmdline")
                     .unwrap_or_default()
                     .trim()
                     .parse::<u32>()
@@ -2415,7 +2471,20 @@ mod tests {
                 1
             );
 
-            guest.ssh_command_l2("sudo shutdown -h now")?;
+            // Let's also verify from the second virtio-net device passed to
+            // the L2 VM.
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command_l2_2("grep -c VFIOTAG /proc/cmdline")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                1
+            );
+
+            guest.ssh_command_l2_1("sudo shutdown -h now")?;
             thread::sleep(std::time::Duration::new(10, 0));
 
             guest.ssh_command_l1("sudo shutdown -h now")?;
@@ -2442,7 +2511,7 @@ mod tests {
             kernel_path.push("vmlinux");
 
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus","boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .args(&[
@@ -2504,7 +2573,7 @@ mod tests {
                 let guest = Guest::new(*disk_config);
 
                 let mut child = Command::new("target/release/cloud-hypervisor")
-                    .args(&["--cpus", "1"])
+                    .args(&["--cpus", "boot=1"])
                     .args(&["--memory", "size=512M"])
                     .args(&["--kernel", guest.fw_path.as_str()])
                     .args(&[
@@ -2575,7 +2644,7 @@ mod tests {
             kernel_path.push("bzImage");
 
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus","boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .args(&[
@@ -2641,7 +2710,7 @@ mod tests {
             let sock = temp_vsock_path(&guest.tmp_dir);
 
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -2870,7 +2939,7 @@ mod tests {
             kernel_path.push("bzImage");
 
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus","boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .args(&[
@@ -2956,7 +3025,7 @@ mod tests {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
             let mut child = Command::new("target/release/cloud-hypervisor")
-                .args(&["--cpus", "1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", guest.fw_path.as_str()])
                 .args(&[
@@ -3035,6 +3104,220 @@ mod tests {
             // They should be different as we expect the BAR reprogramming
             // to have happened.
             aver_ne!(tb, init_bar_addr, new_bar_addr);
+
+            guest.ssh_command("sudo shutdown -h now")?;
+            thread::sleep(std::time::Duration::new(10, 0));
+            let _ = child.kill();
+            let _ = child.wait();
+            Ok(())
+        });
+    }
+
+    fn get_pss(pid: u32) -> u32 {
+        let smaps = fs::File::open(format!("/proc/{}/smaps", pid)).unwrap();
+        let reader = io::BufReader::new(smaps);
+
+        let mut total = 0;
+        for line in reader.lines() {
+            let l = line.unwrap();
+            // Lines look like this:
+            // Pss:                 176 kB
+            if l.contains("Pss") {
+                let values: Vec<&str> = l.rsplit(' ').collect();
+                total += values[1].trim().parse::<u32>().unwrap()
+            }
+        }
+        total
+    }
+
+    fn test_memory_mergeable(mergeable: bool) {
+        test_block!(tb, "", {
+            let memory_param = if mergeable {
+                "mergeable=on"
+            } else {
+                "mergeable=off"
+            };
+
+            let mut clear1 = ClearDiskConfig::new();
+            let mut clear2 = ClearDiskConfig::new();
+
+            let guest1 = Guest::new(&mut clear1 as &mut dyn DiskConfig);
+
+            let mut child1 = Command::new("target/release/cloud-hypervisor")
+                .args(&["--cpus", "boot=1"])
+                .args(&["--memory", format!("size=512M,{}", memory_param).as_str()])
+                .args(&["--kernel", guest1.fw_path.as_str()])
+                .args(&[
+                    "--disk",
+                    format!(
+                        "path={}",
+                        guest1.disk_config.disk(DiskType::OperatingSystem).unwrap()
+                    )
+                    .as_str(),
+                    format!(
+                        "path={}",
+                        guest1.disk_config.disk(DiskType::CloudInit).unwrap()
+                    )
+                    .as_str(),
+                ])
+                .args(&["--net", guest1.default_net_string().as_str()])
+                .args(&["--serial", "tty", "--console", "off"])
+                .spawn()
+                .unwrap();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+
+            // Get initial PSS
+            let old_pss = get_pss(child1.id());
+
+            let guest2 = Guest::new(&mut clear2 as &mut dyn DiskConfig);
+
+            let mut child2 = Command::new("target/release/cloud-hypervisor")
+                .args(&["--cpus", "boot=1"])
+                .args(&["--memory", format!("size=512M,{}", memory_param).as_str()])
+                .args(&["--kernel", guest2.fw_path.as_str()])
+                .args(&[
+                    "--disk",
+                    format!(
+                        "path={}",
+                        guest2.disk_config.disk(DiskType::OperatingSystem).unwrap()
+                    )
+                    .as_str(),
+                    format!(
+                        "path={}",
+                        guest2.disk_config.disk(DiskType::CloudInit).unwrap()
+                    )
+                    .as_str(),
+                ])
+                .args(&["--net", guest2.default_net_string().as_str()])
+                .args(&["--serial", "tty", "--console", "off"])
+                .spawn()
+                .unwrap();
+
+            // Let enough time for the second VM to be spawned, and to make
+            // sure KVM has enough time to merge identical pages between the
+            // 2 VMs.
+            thread::sleep(std::time::Duration::new(30, 0));
+
+            // Get new PSS
+            let new_pss = get_pss(child1.id());
+
+            // Convert PSS from u32 into float.
+            let old_pss = old_pss as f32;
+            let new_pss = new_pss as f32;
+
+            if mergeable {
+                aver!(tb, new_pss < (old_pss * 0.9));
+            } else {
+                aver!(tb, (old_pss * 0.95) < new_pss && new_pss < (old_pss * 1.05));
+            }
+
+            guest1
+                .ssh_command("sudo shutdown -h now")
+                .unwrap_or_default();
+            guest2
+                .ssh_command("sudo shutdown -h now")
+                .unwrap_or_default();
+            thread::sleep(std::time::Duration::new(10, 0));
+            let _ = child1.kill();
+            let _ = child2.kill();
+            let _ = child1.wait();
+            let _ = child2.wait();
+            Ok(())
+        });
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_memory_mergeable_on() {
+        test_memory_mergeable(true)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_memory_mergeable_off() {
+        test_memory_mergeable(false)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_cpu_hotplug() {
+        test_block!(tb, "", {
+            let mut clear = ClearDiskConfig::new();
+            let guest = Guest::new(&mut clear);
+            let api_socket = temp_api_path(&guest.tmp_dir);
+            let mut workload_path = dirs::home_dir().unwrap();
+            workload_path.push("workloads");
+            let mut kernel_path = workload_path.clone();
+            kernel_path.push("vmlinux");
+
+            let mut child = Command::new("target/release/cloud-hypervisor")
+                .args(&["--cpus", "boot=2,max=4"])
+                .args(&["--memory", "size=512M"])
+                .args(&["--kernel", kernel_path.to_str().unwrap()])
+                .args(&["--cmdline", "root=PARTUUID=8d93774b-e12c-4ac5-aa35-77bfa7168767 console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&[
+                    "--disk",
+                    format!(
+                        "path={}",
+                        guest.disk_config.disk(DiskType::OperatingSystem).unwrap()
+                    )
+                    .as_str(),
+                    format!(
+                        "path={}",
+                        guest.disk_config.disk(DiskType::CloudInit).unwrap()
+                    )
+                    .as_str(),
+                ])
+                .args(&["--net", guest.default_net_string().as_str()])
+                .args(&["--api-socket", &api_socket])
+                .spawn()
+                .unwrap();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+
+            aver_eq!(tb, guest.get_cpu_count().unwrap_or_default(), 2);
+
+            // Resize the VM
+            let desired_vcpus = 4;
+            let http_body = guest.api_resize_body(desired_vcpus);
+            curl_command(
+                &api_socket,
+                "PUT",
+                "http://localhost/api/v1/vm.resize",
+                Some(&http_body),
+            );
+
+            guest.ssh_command("echo 1 | sudo tee /sys/bus/cpu/devices/cpu2/online")?;
+            guest.ssh_command("echo 1 | sudo tee /sys/bus/cpu/devices/cpu3/online")?;
+            thread::sleep(std::time::Duration::new(10, 0));
+            aver_eq!(
+                tb,
+                guest.get_cpu_count().unwrap_or_default(),
+                u32::from(desired_vcpus)
+            );
+
+            let reboot_count = guest
+                .ssh_command("sudo journalctl | grep -c -- \"-- Reboot --\"")
+                .unwrap_or_default()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or(1);
+
+            aver_eq!(tb, reboot_count, 0);
+            guest.ssh_command("sudo reboot").unwrap_or_default();
+
+            thread::sleep(std::time::Duration::new(30, 0));
+            let reboot_count = guest
+                .ssh_command("sudo journalctl | grep -c -- \"-- Reboot --\"")
+                .unwrap_or_default()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default();
+            aver_eq!(tb, reboot_count, 1);
+
+            aver_eq!(
+                tb,
+                guest.get_cpu_count().unwrap_or_default(),
+                u32::from(desired_vcpus)
+            );
 
             guest.ssh_command("sudo shutdown -h now")?;
             thread::sleep(std::time::Duration::new(10, 0));

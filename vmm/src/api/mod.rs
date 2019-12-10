@@ -40,7 +40,7 @@ use crate::config::VmConfig;
 use crate::vm::{Error as VmError, VmState};
 use std::io;
 use std::sync::mpsc::{channel, RecvError, SendError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use vmm_sys_util::eventfd::EventFd;
 
 /// API errors are sent back from the VMM API server through the ApiResponse.
@@ -96,18 +96,26 @@ pub enum ApiError {
 
     /// The VMM could not shutdown.
     VmmShutdown(VmError),
+
+    /// The VM could not be resized
+    VmResize(VmError),
 }
 pub type ApiResult<T> = std::result::Result<T, ApiError>;
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct VmInfo {
-    pub config: Arc<VmConfig>,
+    pub config: Arc<Mutex<VmConfig>>,
     pub state: VmState,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct VmmPingResponse {
     pub version: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct VmResizeData {
+    pub desired_vcpus: u8,
 }
 
 pub enum ApiResponsePayload {
@@ -130,7 +138,7 @@ pub enum ApiRequest {
     /// (VmConfig).
     /// If the VMM API server could not create the VM, it will send a VmCreate
     /// error back.
-    VmCreate(Arc<VmConfig>, Sender<ApiResponse>),
+    VmCreate(Arc<Mutex<VmConfig>>, Sender<ApiResponse>),
 
     /// Boot the previously created virtual machine.
     /// If the VM was not previously created, the VMM API server will send a
@@ -169,12 +177,15 @@ pub enum ApiRequest {
     /// This will shutdown and delete the current VM, if any, and then exit the
     /// VMM process.
     VmmShutdown(Sender<ApiResponse>),
+
+    //// Resuze the VMM
+    VmResize(Arc<VmResizeData>, Sender<ApiResponse>),
 }
 
 pub fn vm_create(
     api_evt: EventFd,
     api_sender: Sender<ApiRequest>,
-    config: Arc<VmConfig>,
+    config: Arc<Mutex<VmConfig>>,
 ) -> ApiResult<()> {
     let (response_sender, response_receiver) = channel();
 
@@ -296,6 +307,24 @@ pub fn vmm_shutdown(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResu
     // Send the VMM shutdown request.
     api_sender
         .send(ApiRequest::VmmShutdown(response_sender))
+        .map_err(ApiError::RequestSend)?;
+    api_evt.write(1).map_err(ApiError::EventFdWrite)?;
+
+    response_receiver.recv().map_err(ApiError::ResponseRecv)??;
+
+    Ok(())
+}
+
+pub fn vm_resize(
+    api_evt: EventFd,
+    api_sender: Sender<ApiRequest>,
+    data: Arc<VmResizeData>,
+) -> ApiResult<()> {
+    let (response_sender, response_receiver) = channel();
+
+    // Send the VM creation request.
+    api_sender
+        .send(ApiRequest::VmResize(data, response_sender))
         .map_err(ApiError::RequestSend)?;
     api_evt.write(1).map_err(ApiError::EventFdWrite)?;
 

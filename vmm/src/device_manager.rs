@@ -9,20 +9,22 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 
-use crate::config::ConsoleOutputMode;
+use crate::config::{ConsoleOutputMode, VmConfig};
 use crate::vm::VmInfo;
-
-use devices::ioapic;
-use kvm_bindings::kvm_userspace_memory_region;
+#[cfg(feature = "acpi")]
+use acpi_tables::{aml, aml::Aml};
+use arch::layout;
+use devices::{ioapic, HotPlugNotificationType};
+use kvm_bindings::{kvm_irq_routing_entry, kvm_userspace_memory_region};
 use kvm_ioctls::*;
 use libc::O_TMPFILE;
-use libc::{EFD_NONBLOCK, TIOCGWINSZ};
+use libc::TIOCGWINSZ;
 
 use net_util::Tap;
 #[cfg(feature = "pci_support")]
 use pci::{
     DeviceRelocation, InterruptDelivery, InterruptParameters, PciBarRegionType, PciBus,
-    PciConfigIo, PciConfigMmio, PciDevice, PciInterruptPin, PciRoot,
+    PciConfigIo, PciConfigMmio, PciDevice, PciRoot,
 };
 use qcow::{self, ImageType, QcowFile};
 
@@ -30,6 +32,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, sink, stdout};
 
 use arch::layout::{APIC_START, IOAPIC_SIZE, IOAPIC_START};
+use std::collections::HashMap;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::ptr::null_mut;
@@ -112,14 +115,14 @@ pub enum DeviceManagerError {
     AllocateIrq,
 
     /// Cannot configure the IRQ.
-    Irq(io::Error),
+    Irq(kvm_ioctls::Error),
 
     /// Cannot allocate PCI BARs
     #[cfg(feature = "pci_support")]
     AllocateBars(pci::PciDeviceError),
 
     /// Cannot register ioevent.
-    RegisterIoevent(io::Error),
+    RegisterIoevent(kvm_ioctls::Error),
 
     /// Cannot create virtio device
     VirtioDevice(vmm_sys_util::errno::Error),
@@ -159,7 +162,7 @@ pub enum DeviceManagerError {
     VfioMapRegion(VfioPciError),
 
     /// Failed to create the KVM device.
-    CreateKvmDevice(io::Error),
+    CreateKvmDevice(kvm_ioctls::Error),
 
     /// Failed to memory map.
     Mmap(io::Error),
@@ -169,28 +172,14 @@ pub enum DeviceManagerError {
 
     /// Failed to allocate IO port
     AllocateIOPort,
+
+    // Failed to make hotplug notification
+    HotPlugNotification(io::Error),
 }
 pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
 
 struct InterruptInfo<'a> {
-    _msi_capable: bool,
-    ioapic: &'a Option<Arc<Mutex<ioapic::Ioapic>>>,
-}
-
-struct KernelIoapicIrq {
-    evt: EventFd,
-}
-
-impl KernelIoapicIrq {
-    fn new(evt: EventFd) -> Self {
-        KernelIoapicIrq { evt }
-    }
-}
-
-impl devices::Interrupt for KernelIoapicIrq {
-    fn deliver(&self) -> result::Result<(), io::Error> {
-        self.evt.write(1)
-    }
+    _ioapic: &'a Arc<Mutex<ioapic::Ioapic>>,
 }
 
 struct UserIoapicIrq {
@@ -366,11 +355,15 @@ impl DeviceRelocation for AddressManager {
             if bar_addr == new_base {
                 for (event, addr) in virtio_pci_dev.ioeventfds(old_base) {
                     let io_addr = IoEventAddress::Mmio(addr);
-                    self.vm_fd.unregister_ioevent(event, &io_addr)?;
+                    self.vm_fd
+                        .unregister_ioevent(event, &io_addr)
+                        .map_err(|e| io::Error::from_raw_os_error(e.errno()))?;
                 }
                 for (event, addr) in virtio_pci_dev.ioeventfds(new_base) {
                     let io_addr = IoEventAddress::Mmio(addr);
-                    self.vm_fd.register_ioevent(event, &io_addr, NoDatamatch)?;
+                    self.vm_fd
+                        .register_ioevent(event, &io_addr, NoDatamatch)
+                        .map_err(|e| io::Error::from_raw_os_error(e.errno()))?;
                 }
             }
         }
@@ -398,14 +391,23 @@ pub struct DeviceManager {
     // Virtual IOMMU ID along with the list of device IDs attached to the
     // virtual IOMMU. This is useful for filling the ACPI IORT table.
     virt_iommu: Option<(u32, Vec<u32>)>,
+
+    // ACPI GED notification device
+    #[cfg(feature = "acpi")]
+    ged_notification_device: Option<Arc<Mutex<devices::AcpiGEDDevice>>>,
+
+    // Dimensions of the device area
+    start_of_device_area: GuestAddress,
+    end_of_device_area: GuestAddress,
+
+    // VM configuration
+    config: Arc<Mutex<VmConfig>>,
 }
 
 impl DeviceManager {
     pub fn new(
         vm_info: &VmInfo,
         allocator: SystemAllocator,
-        _msi_capable: bool,
-        userspace_ioapic: bool,
         mut mem_slots: u32,
         _exit_evt: &EventFd,
         reset_evt: &EventFd,
@@ -430,11 +432,8 @@ impl DeviceManager {
             vm_fd: vm_info.vm_fd.clone(),
         });
 
-        let ioapic = DeviceManager::add_ioapic(vm_info, &address_manager, userspace_ioapic)?;
-        let interrupt_info = InterruptInfo {
-            _msi_capable,
-            ioapic: &ioapic,
-        };
+        let ioapic = DeviceManager::add_ioapic(vm_info, &address_manager)?;
+        let interrupt_info = InterruptInfo { _ioapic: &ioapic };
 
         let console = DeviceManager::add_console_device(
             vm_info,
@@ -456,10 +455,13 @@ impl DeviceManager {
             reset_evt.try_clone().map_err(DeviceManagerError::EventFd)?,
         )?;
 
-        DeviceManager::add_acpi_device(
+        #[cfg(feature = "acpi")]
+        let ged_notification_device = DeviceManager::add_acpi_devices(
+            vm_info,
             &address_manager,
             reset_evt.try_clone().map_err(DeviceManagerError::EventFd)?,
             _exit_evt.try_clone().map_err(DeviceManagerError::EventFd)?,
+            &ioapic,
         )?;
 
         if cfg!(feature = "pci_support") {
@@ -481,13 +483,22 @@ impl DeviceManager {
             )?;
         }
 
+        let start_of_device_area = vm_info.start_of_device_area;
+        let end_of_device_area = vm_info.end_of_device_area;
+        let config = vm_info.vm_cfg.clone();
+
         Ok(DeviceManager {
             address_manager,
             console,
-            ioapic,
+            ioapic: Some(ioapic),
             mmap_regions,
             cmdline_additions,
             virt_iommu,
+            #[cfg(feature = "acpi")]
+            ged_notification_device,
+            start_of_device_area,
+            end_of_device_area,
+            config,
         })
     }
 
@@ -508,7 +519,7 @@ impl DeviceManager {
                 Arc::downgrade(&address_manager) as Weak<dyn DeviceRelocation>,
             );
 
-            let (mut iommu_device, iommu_mapping) = if vm_info.vm_cfg.iommu {
+            let (mut iommu_device, iommu_mapping) = if vm_info.vm_cfg.lock().unwrap().iommu {
                 let (device, mapping) =
                     vm_virtio::Iommu::new().map_err(DeviceManagerError::CreateVirtioIommu)?;
                 (Some(device), Some(mapping))
@@ -531,7 +542,6 @@ impl DeviceManager {
                     &address_manager,
                     vm_info.vm_fd,
                     &mut pci_bus,
-                    &interrupt_info,
                     mapping,
                 )?;
 
@@ -567,7 +577,6 @@ impl DeviceManager {
                     &address_manager,
                     vm_info.vm_fd,
                     &mut pci_bus,
-                    &interrupt_info,
                     &None,
                 )?;
 
@@ -632,46 +641,69 @@ impl DeviceManager {
     fn add_ioapic(
         vm_info: &VmInfo,
         address_manager: &Arc<AddressManager>,
-        userspace_ioapic: bool,
-    ) -> DeviceManagerResult<Option<Arc<Mutex<ioapic::Ioapic>>>> {
-        let ioapic = if userspace_ioapic {
-            // Create IOAPIC
-            let ioapic = Arc::new(Mutex::new(ioapic::Ioapic::new(
-                vm_info.vm_fd.clone(),
-                APIC_START,
-            )));
+    ) -> DeviceManagerResult<Arc<Mutex<ioapic::Ioapic>>> {
+        // Create IOAPIC
+        let ioapic = Arc::new(Mutex::new(ioapic::Ioapic::new(
+            vm_info.vm_fd.clone(),
+            APIC_START,
+        )));
 
-            address_manager
-                .mmio_bus
-                .insert(ioapic.clone(), IOAPIC_START.0, IOAPIC_SIZE)
-                .map_err(DeviceManagerError::BusError)?;
-            Some(ioapic)
-        } else {
-            None
-        };
+        address_manager
+            .mmio_bus
+            .insert(ioapic.clone(), IOAPIC_START.0, IOAPIC_SIZE)
+            .map_err(DeviceManagerError::BusError)?;
 
         Ok(ioapic)
     }
 
     #[allow(unused_variables)]
-    fn add_acpi_device(
+    #[cfg(feature = "acpi")]
+    fn add_acpi_devices(
+        vm_info: &VmInfo,
         address_manager: &Arc<AddressManager>,
         reset_evt: EventFd,
         exit_evt: EventFd,
-    ) -> DeviceManagerResult<()> {
-        #[cfg(feature = "acpi")]
-        {
-            let acpi_device = Arc::new(Mutex::new(devices::AcpiShutdownDevice::new(
-                exit_evt, reset_evt,
-            )));
+        ioapic: &Arc<Mutex<ioapic::Ioapic>>,
+    ) -> DeviceManagerResult<Option<Arc<Mutex<devices::AcpiGEDDevice>>>> {
+        let acpi_device = Arc::new(Mutex::new(devices::AcpiShutdownDevice::new(
+            exit_evt, reset_evt,
+        )));
 
-            address_manager
-                .io_bus
-                .insert(acpi_device.clone(), 0x3c0, 0x4)
-                .map_err(DeviceManagerError::BusError)?;
-        }
+        address_manager
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate_io_addresses(Some(GuestAddress(0x3c0)), 0x8, None)
+            .ok_or(DeviceManagerError::AllocateIOPort)?;
 
-        Ok(())
+        address_manager
+            .io_bus
+            .insert(acpi_device.clone(), 0x3c0, 0x4)
+            .map_err(DeviceManagerError::BusError)?;
+
+        let ged_irq = address_manager
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate_irq()
+            .unwrap();
+        let interrupt: Box<dyn devices::Interrupt> =
+            Box::new(UserIoapicIrq::new(ioapic.clone(), ged_irq as usize));
+
+        let ged_device = Arc::new(Mutex::new(devices::AcpiGEDDevice::new(interrupt, ged_irq)));
+
+        address_manager
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate_io_addresses(Some(GuestAddress(0xb000)), 0x1, None)
+            .ok_or(DeviceManagerError::AllocateIOPort)?;
+
+        address_manager
+            .io_bus
+            .insert(ged_device.clone(), 0xb000, 0x1)
+            .map_err(DeviceManagerError::BusError)?;
+        Ok(Some(ged_device))
     }
 
     fn add_legacy_devices(
@@ -711,31 +743,23 @@ impl DeviceManager {
     fn add_console_device(
         vm_info: &VmInfo,
         address_manager: &Arc<AddressManager>,
-        ioapic: &Option<Arc<Mutex<ioapic::Ioapic>>>,
+        ioapic: &Arc<Mutex<ioapic::Ioapic>>,
         virtio_devices: &mut Vec<(Box<dyn vm_virtio::VirtioDevice>, bool)>,
     ) -> DeviceManagerResult<Arc<Console>> {
-        let serial_writer: Option<Box<dyn io::Write + Send>> = match vm_info.vm_cfg.serial.mode {
+        let serial_config = vm_info.vm_cfg.lock().unwrap().serial.clone();
+        let serial_writer: Option<Box<dyn io::Write + Send>> = match serial_config.mode {
             ConsoleOutputMode::File => Some(Box::new(
-                File::create(vm_info.vm_cfg.serial.file.as_ref().unwrap())
+                File::create(serial_config.file.as_ref().unwrap())
                     .map_err(DeviceManagerError::SerialOutputFileOpen)?,
             )),
             ConsoleOutputMode::Tty => Some(Box::new(stdout())),
             ConsoleOutputMode::Off | ConsoleOutputMode::Null => None,
         };
-        let serial = if vm_info.vm_cfg.serial.mode != ConsoleOutputMode::Off {
+        let serial = if serial_config.mode != ConsoleOutputMode::Off {
             // Serial is tied to IRQ #4
             let serial_irq = 4;
-            let interrupt: Box<dyn devices::Interrupt> = if let Some(ioapic) = &ioapic {
-                Box::new(UserIoapicIrq::new(ioapic.clone(), serial_irq))
-            } else {
-                let serial_evt = EventFd::new(EFD_NONBLOCK).map_err(DeviceManagerError::EventFd)?;
-                vm_info
-                    .vm_fd
-                    .register_irqfd(&serial_evt, serial_irq as u32)
-                    .map_err(DeviceManagerError::Irq)?;
-
-                Box::new(KernelIoapicIrq::new(serial_evt))
-            };
+            let interrupt: Box<dyn devices::Interrupt> =
+                Box::new(UserIoapicIrq::new(ioapic.clone(), serial_irq));
 
             let serial = Arc::new(Mutex::new(devices::legacy::Serial::new(
                 interrupt,
@@ -760,20 +784,29 @@ impl DeviceManager {
         };
 
         // Create serial and virtio-console
-        let console_writer: Option<Box<dyn io::Write + Send + Sync>> =
-            match vm_info.vm_cfg.console.mode {
-                ConsoleOutputMode::File => Some(Box::new(
-                    File::create(vm_info.vm_cfg.console.file.as_ref().unwrap())
-                        .map_err(DeviceManagerError::ConsoleOutputFileOpen)?,
-                )),
-                ConsoleOutputMode::Tty => Some(Box::new(stdout())),
-                ConsoleOutputMode::Null => Some(Box::new(sink())),
-                ConsoleOutputMode::Off => None,
-            };
+        let console_config = vm_info.vm_cfg.lock().unwrap().console.clone();
+        let console_writer: Option<Box<dyn io::Write + Send + Sync>> = match console_config.mode {
+            ConsoleOutputMode::File => Some(Box::new(
+                File::create(
+                    vm_info
+                        .vm_cfg
+                        .lock()
+                        .unwrap()
+                        .console
+                        .file
+                        .as_ref()
+                        .unwrap(),
+                )
+                .map_err(DeviceManagerError::ConsoleOutputFileOpen)?,
+            )),
+            ConsoleOutputMode::Tty => Some(Box::new(stdout())),
+            ConsoleOutputMode::Null => Some(Box::new(sink())),
+            ConsoleOutputMode::Off => None,
+        };
         let (col, row) = get_win_size();
         let console_input = if let Some(writer) = console_writer {
             let (virtio_console_device, console_input) =
-                vm_virtio::Console::new(writer, col, row, vm_info.vm_cfg.console.iommu)
+                vm_virtio::Console::new(writer, col, row, console_config.iommu)
                     .map_err(DeviceManagerError::CreateVirtioConsole)?;
             virtio_devices.push((
                 Box::new(virtio_console_device) as Box<dyn vm_virtio::VirtioDevice>,
@@ -787,8 +820,8 @@ impl DeviceManager {
         Ok(Arc::new(Console {
             serial,
             console_input,
-            input_enabled: vm_info.vm_cfg.serial.mode.input_enabled()
-                || vm_info.vm_cfg.console.mode.input_enabled(),
+            input_enabled: serial_config.mode.input_enabled()
+                || console_config.mode.input_enabled(),
         }))
     }
 
@@ -843,7 +876,7 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Vec<(Box<dyn vm_virtio::VirtioDevice>, bool)>> {
         let mut devices = Vec::new();
 
-        if let Some(disk_list_cfg) = &vm_info.vm_cfg.disks {
+        if let Some(disk_list_cfg) = &vm_info.vm_cfg.lock().unwrap().disks {
             for disk_cfg in disk_list_cfg.iter() {
                 // Open block device path
                 let raw_img: File = OpenOptions::new()
@@ -893,7 +926,7 @@ impl DeviceManager {
         let mut devices = Vec::new();
 
         // Add virtio-net if required
-        if let Some(net_list_cfg) = &vm_info.vm_cfg.net {
+        if let Some(net_list_cfg) = &vm_info.vm_cfg.lock().unwrap().net {
             for net_cfg in net_list_cfg.iter() {
                 let virtio_net_device = if let Some(ref tap_if_name) = net_cfg.tap {
                     let tap = Tap::open_named(tap_if_name).map_err(DeviceManagerError::OpenTap)?;
@@ -920,8 +953,9 @@ impl DeviceManager {
         let mut devices = Vec::new();
 
         // Add virtio-rng if required
-        if let Some(rng_path) = vm_info.vm_cfg.rng.src.to_str() {
-            let virtio_rng_device = vm_virtio::Rng::new(rng_path, vm_info.vm_cfg.rng.iommu)
+        let rng_config = vm_info.vm_cfg.lock().unwrap().rng.clone();
+        if let Some(rng_path) = rng_config.src.to_str() {
+            let virtio_rng_device = vm_virtio::Rng::new(rng_path, rng_config.iommu)
                 .map_err(DeviceManagerError::CreateVirtioRng)?;
             devices.push((
                 Box::new(virtio_rng_device) as Box<dyn vm_virtio::VirtioDevice>,
@@ -940,7 +974,7 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Vec<(Box<dyn vm_virtio::VirtioDevice>, bool)>> {
         let mut devices = Vec::new();
         // Add virtio-fs if required
-        if let Some(fs_list_cfg) = &vm_info.vm_cfg.fs {
+        if let Some(fs_list_cfg) = &vm_info.vm_cfg.lock().unwrap().fs {
             for fs_cfg in fs_list_cfg.iter() {
                 if let Some(fs_sock) = fs_cfg.sock.to_str() {
                     let mut cache: Option<(VirtioSharedMemoryList, u64)> = None;
@@ -1027,7 +1061,7 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Vec<(Box<dyn vm_virtio::VirtioDevice>, bool)>> {
         let mut devices = Vec::new();
         // Add virtio-pmem if required
-        if let Some(pmem_list_cfg) = &vm_info.vm_cfg.pmem {
+        if let Some(pmem_list_cfg) = &vm_info.vm_cfg.lock().unwrap().pmem {
             for pmem_cfg in pmem_list_cfg.iter() {
                 let size = pmem_cfg.size;
 
@@ -1078,6 +1112,31 @@ impl DeviceManager {
                 // Safe because the guest regions are guaranteed not to overlap.
                 let _ = unsafe { vm_info.vm_fd.set_user_memory_region(mem_region) };
 
+                // Mark the pages as mergeable if explicitly asked for.
+                if pmem_cfg.mergeable {
+                    // Safe because the address and size are valid since the
+                    // mmap succeeded..
+                    let ret = unsafe {
+                        libc::madvise(
+                            addr as *mut libc::c_void,
+                            size as libc::size_t,
+                            libc::MADV_MERGEABLE,
+                        )
+                    };
+                    if ret != 0 {
+                        let err = io::Error::last_os_error();
+                        // Safe to unwrap because the error is constructed with
+                        // last_os_error(), which ensures the output will be Some().
+                        let errno = err.raw_os_error().unwrap();
+                        if errno == libc::EINVAL {
+                            warn!("kernel not configured with CONFIG_KSM");
+                        } else {
+                            warn!("madvise error: {}", err);
+                        }
+                        warn!("failed to mark pages as mergeable");
+                    }
+                }
+
                 // Increment the KVM slot number
                 *mem_slots += 1;
 
@@ -1100,7 +1159,7 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Vec<(Box<dyn vm_virtio::VirtioDevice>, bool)>> {
         let mut devices = Vec::new();
         // Add vhost-user-net if required
-        if let Some(vhost_user_net_list_cfg) = &vm_info.vm_cfg.vhost_user_net {
+        if let Some(vhost_user_net_list_cfg) = &vm_info.vm_cfg.lock().unwrap().vhost_user_net {
             for vhost_user_net_cfg in vhost_user_net_list_cfg.iter() {
                 let vu_cfg = VhostUserConfig {
                     sock: vhost_user_net_cfg.vu_cfg.sock.clone(),
@@ -1126,7 +1185,7 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Vec<(Box<dyn vm_virtio::VirtioDevice>, bool)>> {
         let mut devices = Vec::new();
         // Add vhost-user-blk if required
-        if let Some(vhost_user_blk_list_cfg) = &vm_info.vm_cfg.vhost_user_blk {
+        if let Some(vhost_user_blk_list_cfg) = &vm_info.vm_cfg.lock().unwrap().vhost_user_blk {
             for vhost_user_blk_cfg in vhost_user_blk_list_cfg.iter() {
                 let vu_cfg = VhostUserConfig {
                     sock: vhost_user_blk_cfg.vu_cfg.sock.clone(),
@@ -1152,7 +1211,7 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Vec<(Box<dyn vm_virtio::VirtioDevice>, bool)>> {
         let mut devices = Vec::new();
         // Add vsock if required
-        if let Some(vsock_list_cfg) = &vm_info.vm_cfg.vsock {
+        if let Some(vsock_list_cfg) = &vm_info.vm_cfg.lock().unwrap().vsock {
             for vsock_cfg in vsock_list_cfg.iter() {
                 let socket_path = vsock_cfg
                     .sock
@@ -1198,7 +1257,15 @@ impl DeviceManager {
         let mut mem_slot = mem_slots;
         let mut iommu_attached_device_ids = Vec::new();
         let mut allocator = address_manager.allocator.lock().unwrap();
-        if let Some(device_list_cfg) = &vm_info.vm_cfg.devices {
+
+        // Create a shared list of GSI that can be shared through all VFIO
+        // devices. This way, we can maintain the full list of used GSI,
+        // preventing one device from overriding interrupts setting from
+        // another one.
+        let gsi_msi_routes: Arc<Mutex<HashMap<u32, kvm_irq_routing_entry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        if let Some(device_list_cfg) = &vm_info.vm_cfg.lock().unwrap().devices {
             // Create the KVM VFIO device
             let device_fd = DeviceManager::create_kvm_device(vm_info.vm_fd)?;
             let device_fd = Arc::new(device_fd);
@@ -1231,9 +1298,13 @@ impl DeviceManager {
                     }
                 }
 
-                let mut vfio_pci_device =
-                    VfioPciDevice::new(vm_info.vm_fd, &mut allocator, vfio_device)
-                        .map_err(DeviceManagerError::VfioPciCreate)?;
+                let mut vfio_pci_device = VfioPciDevice::new(
+                    vm_info.vm_fd,
+                    &mut allocator,
+                    vfio_device,
+                    gsi_msi_routes.clone(),
+                )
+                .map_err(DeviceManagerError::VfioPciCreate)?;
 
                 let bars = vfio_pci_device
                     .allocate_bars(&mut allocator)
@@ -1268,17 +1339,12 @@ impl DeviceManager {
         address_manager: &Arc<AddressManager>,
         vm_fd: &Arc<VmFd>,
         pci: &mut PciBus,
-        interrupt_info: &InterruptInfo,
         iommu_mapping: &Option<Arc<IommuMapping>>,
     ) -> DeviceManagerResult<Option<u32>> {
-        let msix_num = if interrupt_info._msi_capable {
-            // Allows support for one MSI-X vector per queue. It also adds 1
-            // as we need to take into account the dedicated vector to notify
-            // about a virtio config change.
-            (virtio_device.queue_max_sizes().len() + 1) as u16
-        } else {
-            0
-        };
+        // Allows support for one MSI-X vector per queue. It also adds 1
+        // as we need to take into account the dedicated vector to notify
+        // about a virtio config change.
+        let msix_num = (virtio_device.queue_max_sizes().len() + 1) as u16;
 
         // We need to shift the device id since the 3 first bits are dedicated
         // to the PCI function, and we know we don't do multifunction.
@@ -1325,71 +1391,39 @@ impl DeviceManager {
                 .map_err(DeviceManagerError::RegisterIoevent)?;
         }
 
-        if interrupt_info._msi_capable {
-            let vm_fd_clone = vm_fd.clone();
+        let vm_fd_clone = vm_fd.clone();
 
-            let msi_cb = Arc::new(Box::new(move |p: InterruptParameters| {
-                if let Some(entry) = p.msix {
-                    use kvm_bindings::kvm_msi;
-                    let msi_queue = kvm_msi {
-                        address_lo: entry.msg_addr_lo,
-                        address_hi: entry.msg_addr_hi,
-                        data: entry.msg_data,
-                        flags: 0u32,
-                        devid: 0u32,
-                        pad: [0u8; 12],
-                    };
+        let msi_cb = Arc::new(Box::new(move |p: InterruptParameters| {
+            if let Some(entry) = p.msix {
+                use kvm_bindings::kvm_msi;
+                let msi_queue = kvm_msi {
+                    address_lo: entry.msg_addr_lo,
+                    address_hi: entry.msg_addr_hi,
+                    data: entry.msg_data,
+                    flags: 0u32,
+                    devid: 0u32,
+                    pad: [0u8; 12],
+                };
 
-                    return vm_fd_clone.signal_msi(msi_queue).map(|ret| {
+                return vm_fd_clone
+                    .signal_msi(msi_queue)
+                    .map_err(|e| io::Error::from_raw_os_error(e.errno()))
+                    .map(|ret| {
                         if ret > 0 {
                             debug!("MSI message successfully delivered");
                         } else if ret == 0 {
                             warn!("failed to deliver MSI message, blocked by guest");
                         }
                     });
-                }
+            }
 
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "missing MSI-X entry",
-                ))
-            }) as InterruptDelivery);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "missing MSI-X entry",
+            ))
+        }) as InterruptDelivery);
 
-            virtio_pci_device.assign_msix(msi_cb);
-        } else {
-            let irq_num = allocator
-                .allocate_irq()
-                .ok_or(DeviceManagerError::AllocateIrq)?;
-
-            let irq_cb = if let Some(ioapic) = interrupt_info.ioapic {
-                let ioapic_clone = ioapic.clone();
-                Box::new(move |_p: InterruptParameters| {
-                    ioapic_clone
-                        .lock()
-                        .unwrap()
-                        .service_irq(irq_num as usize)
-                        .map_err(|e| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("failed to inject IRQ #{}: {:?}", irq_num, e),
-                            )
-                        })
-                }) as InterruptDelivery
-            } else {
-                let irqfd = EventFd::new(EFD_NONBLOCK).map_err(DeviceManagerError::EventFd)?;
-                vm_fd
-                    .register_irqfd(&irqfd, irq_num)
-                    .map_err(DeviceManagerError::Irq)?;
-
-                Box::new(move |_p: InterruptParameters| irqfd.write(1)) as InterruptDelivery
-            };
-
-            virtio_pci_device.assign_pin_irq(
-                Arc::new(irq_cb),
-                irq_num as u32,
-                PciInterruptPin::IntA,
-            );
-        }
+        virtio_pci_device.assign_msix(msi_cb);
 
         let virtio_pci_device = Arc::new(Mutex::new(virtio_pci_device));
 
@@ -1441,17 +1475,10 @@ impl DeviceManager {
             .allocate_irq()
             .ok_or(DeviceManagerError::AllocateIrq)?;
 
-        let interrupt: Box<dyn devices::Interrupt> = if let Some(ioapic) = interrupt_info.ioapic {
-            Box::new(UserIoapicIrq::new(ioapic.clone(), irq_num as usize))
-        } else {
-            let irqfd = EventFd::new(EFD_NONBLOCK).map_err(DeviceManagerError::EventFd)?;
-
-            vm_fd
-                .register_irqfd(&irqfd, irq_num as u32)
-                .map_err(DeviceManagerError::Irq)?;
-
-            Box::new(KernelIoapicIrq::new(irqfd))
-        };
+        let interrupt: Box<dyn devices::Interrupt> = Box::new(UserIoapicIrq::new(
+            interrupt_info._ioapic.clone(),
+            irq_num as usize,
+        ));
 
         mmio_device.assign_interrupt(interrupt);
 
@@ -1501,6 +1528,23 @@ impl DeviceManager {
             None
         }
     }
+
+    pub fn notify_hotplug(
+        &self,
+        _notification_type: HotPlugNotificationType,
+    ) -> DeviceManagerResult<()> {
+        #[cfg(feature = "acpi")]
+        return self
+            .ged_notification_device
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .notify(_notification_type)
+            .map_err(DeviceManagerError::HotPlugNotification);
+        #[cfg(not(feature = "acpi"))]
+        return Ok(());
+    }
 }
 
 impl Drop for DeviceManager {
@@ -1510,5 +1554,134 @@ impl Drop for DeviceManager {
                 libc::munmap(addr, size);
             }
         }
+    }
+}
+
+#[cfg(feature = "acpi")]
+fn create_ged_device(ged_irq: u32) -> Vec<u8> {
+    aml::Device::new(
+        "_SB_.GED_".into(),
+        vec![
+            &aml::Name::new("_HID".into(), &"ACPI0013"),
+            &aml::Name::new("_UID".into(), &aml::ZERO),
+            &aml::Name::new(
+                "_CRS".into(),
+                &aml::ResourceTemplate::new(vec![&aml::Interrupt::new(
+                    true, true, false, false, ged_irq,
+                )]),
+            ),
+            &aml::OpRegion::new("GDST".into(), aml::OpRegionSpace::SystemIO, 0xb000, 0x1),
+            &aml::Field::new(
+                "GDST".into(),
+                aml::FieldAccessType::Byte,
+                aml::FieldUpdateRule::WriteAsZeroes,
+                vec![aml::FieldEntry::Named(*b"GDAT", 8)],
+            ),
+            &aml::Method::new(
+                "_EVT".into(),
+                1,
+                true,
+                vec![&aml::If::new(
+                    &aml::Equal::new(&aml::Path::new("GDAT"), &aml::ONE),
+                    vec![&aml::MethodCall::new("\\_SB_.CPUS.CTFY".into(), vec![])],
+                )],
+            ),
+        ],
+    )
+    .to_aml_bytes()
+}
+
+#[cfg(feature = "acpi")]
+impl Aml for DeviceManager {
+    fn to_aml_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let pci_dsdt_data = aml::Device::new(
+            "_SB_.PCI0".into(),
+            vec![
+                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0A08")),
+                &aml::Name::new("_CID".into(), &aml::EISAName::new("PNP0A03")),
+                &aml::Name::new("_ADR".into(), &aml::ZERO),
+                &aml::Name::new("_SEG".into(), &aml::ZERO),
+                &aml::Name::new("_UID".into(), &aml::ZERO),
+                &aml::Name::new("SUPP".into(), &aml::ZERO),
+                &aml::Name::new(
+                    "_CRS".into(),
+                    &aml::ResourceTemplate::new(vec![
+                        &aml::AddressSpace::new_bus_number(0x0u16, 0xffu16),
+                        &aml::IO::new(0xcf8, 0xcf8, 1, 0x8),
+                        &aml::AddressSpace::new_io(0x0u16, 0xcf7u16),
+                        &aml::AddressSpace::new_io(0xd00u16, 0xffffu16),
+                        &aml::AddressSpace::new_memory(
+                            aml::AddressSpaceCachable::NotCacheable,
+                            true,
+                            layout::MEM_32BIT_DEVICES_START.0 as u32,
+                            (layout::MEM_32BIT_DEVICES_START.0 + layout::MEM_32BIT_DEVICES_SIZE - 1)
+                                as u32,
+                        ),
+                        &aml::AddressSpace::new_memory(
+                            aml::AddressSpaceCachable::NotCacheable,
+                            true,
+                            self.start_of_device_area.0,
+                            self.end_of_device_area.0,
+                        ),
+                    ]),
+                ),
+            ],
+        )
+        .to_aml_bytes();
+
+        let mbrd_dsdt_data = aml::Device::new(
+            "_SB_.MBRD".into(),
+            vec![
+                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0C02")),
+                &aml::Name::new("_UID".into(), &aml::ZERO),
+                &aml::Name::new(
+                    "_CRS".into(),
+                    &aml::ResourceTemplate::new(vec![&aml::Memory32Fixed::new(
+                        true,
+                        layout::PCI_MMCONFIG_START.0 as u32,
+                        layout::PCI_MMCONFIG_SIZE as u32,
+                    )]),
+                ),
+            ],
+        )
+        .to_aml_bytes();
+
+        let com1_dsdt_data = aml::Device::new(
+            "_SB_.COM1".into(),
+            vec![
+                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0501")),
+                &aml::Name::new("_UID".into(), &aml::ZERO),
+                &aml::Name::new(
+                    "_CRS".into(),
+                    &aml::ResourceTemplate::new(vec![
+                        &aml::Interrupt::new(true, true, false, false, 4),
+                        &aml::IO::new(0x3f8, 0x3f8, 0, 0x8),
+                    ]),
+                ),
+            ],
+        )
+        .to_aml_bytes();
+
+        let s5_sleep_data =
+            aml::Name::new("_S5_".into(), &aml::Package::new(vec![&5u8])).to_aml_bytes();
+
+        let ged_data = create_ged_device(
+            self.ged_notification_device
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .irq(),
+        );
+
+        bytes.extend_from_slice(pci_dsdt_data.as_slice());
+        bytes.extend_from_slice(mbrd_dsdt_data.as_slice());
+        if self.config.lock().unwrap().serial.mode != ConsoleOutputMode::Off {
+            bytes.extend_from_slice(com1_dsdt_data.as_slice());
+        }
+        bytes.extend_from_slice(s5_sleep_data.as_slice());
+        bytes.extend_from_slice(ged_data.as_slice());
+        bytes
     }
 }

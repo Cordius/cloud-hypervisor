@@ -27,16 +27,13 @@ use crate::config::VmConfig;
 use crate::cpu;
 use crate::device_manager::{get_win_size, Console, DeviceManager, DeviceManagerError};
 use arch::RegionType;
-use devices::ioapic;
-use kvm_bindings::{
-    kvm_enable_cap, kvm_pit_config, kvm_userspace_memory_region, KVM_CAP_SPLIT_IRQCHIP,
-    KVM_PIT_SPEAKER_DUMMY,
-};
+use devices::{ioapic, HotPlugNotificationType};
+use kvm_bindings::{kvm_enable_cap, kvm_userspace_memory_region, KVM_CAP_SPLIT_IRQCHIP};
 use kvm_ioctls::*;
 
 use linux_loader::cmdline::Cmdline;
 use linux_loader::loader::KernelLoader;
-use signal_hook::{iterator::Signals, SIGWINCH};
+use signal_hook::{iterator::Signals, SIGINT, SIGTERM, SIGWINCH};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -70,10 +67,10 @@ pub enum Error {
     VmFd(io::Error),
 
     /// Cannot create the KVM instance
-    VmCreate(io::Error),
+    VmCreate(kvm_ioctls::Error),
 
     /// Cannot set the VM up
-    VmSetup(io::Error),
+    VmSetup(kvm_ioctls::Error),
 
     /// Cannot open the kernel image
     KernelFile(io::Error),
@@ -129,7 +126,7 @@ pub enum Error {
     ThreadCleanup,
 
     /// Failed to create a new KVM instance
-    KvmNew(io::Error),
+    KvmNew(kvm_ioctls::Error),
 
     /// VM is not created
     VmNotCreated,
@@ -145,13 +142,18 @@ pub enum Error {
 
     /// Error from CPU handling
     CpuManager(cpu::Error),
+
+    /// Capability missing
+    CapabilityMissing(Cap),
 }
 pub type Result<T> = result::Result<T, Error>;
 
 pub struct VmInfo<'a> {
     pub memory: &'a Arc<RwLock<GuestMemoryMmap>>,
     pub vm_fd: &'a Arc<VmFd>,
-    pub vm_cfg: &'a VmConfig,
+    pub vm_cfg: Arc<Mutex<VmConfig>>,
+    pub start_of_device_area: GuestAddress,
+    pub end_of_device_area: GuestAddress,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
@@ -201,7 +203,7 @@ pub struct Vm {
     memory: Arc<RwLock<GuestMemoryMmap>>,
     threads: Vec<thread::JoinHandle<()>>,
     devices: DeviceManager,
-    config: Arc<VmConfig>,
+    config: Arc<Mutex<VmConfig>>,
     on_tty: bool,
     signals: Option<Signals>,
     state: RwLock<VmState>,
@@ -213,9 +215,23 @@ fn get_host_cpu_phys_bits() -> u8 {
     unsafe {
         let leaf = x86_64::__cpuid(0x8000_0000);
 
+        // Detect and handle AMD SME (Secure Memory Encryption) properly.
+        // Some physical address bits may become reserved when the feature is enabled.
+        // See AMD64 Architecture Programmer's Manual Volume 2, Section 7.10.1
+        let reduced = if leaf.eax >= 0x8000_001f
+            && leaf.ebx == 0x6874_7541    // Vendor ID: AuthenticAMD
+            && leaf.ecx == 0x444d_4163
+            && leaf.edx == 0x6974_6e65
+            && x86_64::__cpuid(0x8000_001f).eax & 0x1 != 0
+        {
+            (x86_64::__cpuid(0x8000_001f).ebx >> 6) & 0x3f
+        } else {
+            0
+        };
+
         if leaf.eax >= 0x8000_0008 {
             let leaf = x86_64::__cpuid(0x8000_0008);
-            (leaf.eax & 0xff) as u8
+            ((leaf.eax & 0xff) - reduced) as u8
         } else {
             36
         }
@@ -223,15 +239,33 @@ fn get_host_cpu_phys_bits() -> u8 {
 }
 
 impl Vm {
-    pub fn new(config: Arc<VmConfig>, exit_evt: EventFd, reset_evt: EventFd) -> Result<Self> {
+    pub fn new(
+        config: Arc<Mutex<VmConfig>>,
+        exit_evt: EventFd,
+        reset_evt: EventFd,
+    ) -> Result<Self> {
         let kvm = Kvm::new().map_err(Error::KvmNew)?;
-        let kernel =
-            File::open(&config.kernel.as_ref().unwrap().path).map_err(Error::KernelFile)?;
+
+        // Check required capabilities:
+        if !kvm.check_extension(Cap::SignalMsi) {
+            return Err(Error::CapabilityMissing(Cap::SignalMsi));
+        }
+
+        if !kvm.check_extension(Cap::TscDeadlineTimer) {
+            return Err(Error::CapabilityMissing(Cap::TscDeadlineTimer));
+        }
+
+        if !kvm.check_extension(Cap::SplitIrqchip) {
+            return Err(Error::CapabilityMissing(Cap::SplitIrqchip));
+        }
+
+        let kernel = File::open(&config.lock().unwrap().kernel.as_ref().unwrap().path)
+            .map_err(Error::KernelFile)?;
         let fd = kvm.create_vm().map_err(Error::VmCreate)?;
         let fd = Arc::new(fd);
 
         // Init guest memory
-        let arch_mem_regions = arch::arch_memory_regions(config.memory.size);
+        let arch_mem_regions = arch::arch_memory_regions(config.lock().unwrap().memory.size);
 
         let ram_regions: Vec<(GuestAddress, usize)> = arch_mem_regions
             .iter()
@@ -254,7 +288,7 @@ impl Vm {
             }
         }
 
-        let guest_memory = match config.memory.file {
+        let guest_memory = match config.lock().unwrap().memory.file {
             Some(ref file) => {
                 let mut mem_regions = Vec::<(GuestAddress, usize, Option<FileOffset>)>::new();
                 for region in ram_regions.iter() {
@@ -301,57 +335,63 @@ impl Vm {
                 };
 
                 // Safe because the guest regions are guaranteed not to overlap.
-                unsafe { fd.set_user_memory_region(mem_region) }
+                unsafe {
+                    fd.set_user_memory_region(mem_region)
+                        .map_err(|e| io::Error::from_raw_os_error(e.errno()))
+                }?;
+
+                // Mark the pages as mergeable if explicitly asked for.
+                if config.lock().unwrap().memory.mergeable {
+                    // Safe because the address and size are valid since the
+                    // mmap succeeded.
+                    let ret = unsafe {
+                        libc::madvise(
+                            region.as_ptr() as *mut libc::c_void,
+                            region.len() as libc::size_t,
+                            libc::MADV_MERGEABLE,
+                        )
+                    };
+                    if ret != 0 {
+                        let err = io::Error::last_os_error();
+                        // Safe to unwrap because the error is constructed with
+                        // last_os_error(), which ensures the output will be Some().
+                        let errno = err.raw_os_error().unwrap();
+                        if errno == libc::EINVAL {
+                            warn!("kernel not configured with CONFIG_KSM");
+                        } else {
+                            warn!("madvise error: {}", err);
+                        }
+                        warn!("failed to mark pages as mergeable");
+                    }
+                }
+
+                Ok(())
             })
-            .map_err(|_| Error::GuestMemory(MmapError::NoMemoryRegion))?;
+            .map_err(|_: io::Error| Error::GuestMemory(MmapError::NoMemoryRegion))?;
 
         // Set TSS
         fd.set_tss_address(arch::x86_64::layout::KVM_TSS_ADDRESS.raw_value() as usize)
             .map_err(Error::VmSetup)?;
 
-        let msi_capable = kvm.check_extension(Cap::SignalMsi);
-
         let mut cpuid_patches = Vec::new();
-        let mut userspace_ioapic = false;
-        if kvm.check_extension(Cap::TscDeadlineTimer) {
-            if kvm.check_extension(Cap::SplitIrqchip) && msi_capable {
-                // Create split irqchip
-                // Only the local APIC is emulated in kernel, both PICs and IOAPIC
-                // are not.
-                let mut cap: kvm_enable_cap = Default::default();
-                cap.cap = KVM_CAP_SPLIT_IRQCHIP;
-                cap.args[0] = ioapic::NUM_IOAPIC_PINS as u64;
-                fd.enable_cap(&cap).map_err(Error::VmSetup)?;
+        // Create split irqchip
+        // Only the local APIC is emulated in kernel, both PICs and IOAPIC
+        // are not.
+        let mut cap: kvm_enable_cap = Default::default();
+        cap.cap = KVM_CAP_SPLIT_IRQCHIP;
+        cap.args[0] = ioapic::NUM_IOAPIC_PINS as u64;
+        fd.enable_cap(&cap).map_err(Error::VmSetup)?;
 
-                // Because of the split irqchip, we need a userspace IOAPIC.
-                userspace_ioapic = true;
-            } else {
-                // Create irqchip
-                // A local APIC, 2 PICs and an IOAPIC are emulated in kernel.
-                fd.create_irq_chip().map_err(Error::VmSetup)?;
-            }
-
-            // Patch tsc deadline timer bit
-            cpuid_patches.push(cpu::CpuidPatch {
-                function: 1,
-                index: 0,
-                flags_bit: None,
-                eax_bit: None,
-                ebx_bit: None,
-                ecx_bit: Some(TSC_DEADLINE_TIMER_ECX_BIT),
-                edx_bit: None,
-            });
-        } else {
-            // Create irqchip
-            // A local APIC, 2 PICs and an IOAPIC are emulated in kernel.
-            fd.create_irq_chip().map_err(Error::VmSetup)?;
-            // Creates an in-kernel device model for the PIT.
-            let mut pit_config = kvm_pit_config::default();
-            // We need to enable the emulation of a dummy speaker port stub so that writing to port 0x61
-            // (i.e. KVM_SPEAKER_BASE_ADDRESS) does not trigger an exit to user space.
-            pit_config.flags = KVM_PIT_SPEAKER_DUMMY;
-            fd.create_pit2(pit_config).map_err(Error::VmSetup)?;
-        }
+        // Patch tsc deadline timer bit
+        cpuid_patches.push(cpu::CpuidPatch {
+            function: 1,
+            index: 0,
+            flags_bit: None,
+            eax_bit: None,
+            ebx_bit: None,
+            ecx_bit: Some(TSC_DEADLINE_TIMER_ECX_BIT),
+            edx_bit: None,
+        });
 
         // Patch hypervisor bit
         cpuid_patches.push(cpu::CpuidPatch {
@@ -366,7 +406,7 @@ impl Vm {
 
         // Supported CPUID
         let mut cpuid = kvm
-            .get_supported_cpuid(MAX_KVM_CPUID_ENTRIES)
+            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
             .map_err(Error::VmSetup)?;
 
         cpu::CpuidPatch::patch_cpuid(&mut cpuid, cpuid_patches);
@@ -395,6 +435,14 @@ impl Vm {
                 .ok_or(Error::MemoryRangeAllocation)?;
         }
 
+        let end_of_device_area = GuestAddress((1 << get_host_cpu_phys_bits()) - 1);
+        let mem_end = guest_memory.end_addr();
+        let start_of_device_area = if mem_end < arch::layout::MEM_32BIT_RESERVED_START {
+            arch::layout::RAM_64BIT_START
+        } else {
+            mem_end.unchecked_add(1)
+        };
+
         // Convert the guest memory into an Arc. The point being able to use it
         // anywhere in the code, no matter which thread might use it.
         // Add the RwLock aspect to guest memory as we might want to perform
@@ -404,14 +452,14 @@ impl Vm {
         let vm_info = VmInfo {
             memory: &guest_memory,
             vm_fd: &fd,
-            vm_cfg: &config,
+            vm_cfg: config.clone(),
+            start_of_device_area,
+            end_of_device_area,
         };
 
         let device_manager = DeviceManager::new(
             &vm_info,
             allocator,
-            msi_capable,
-            userspace_ioapic,
             ram_regions.len() as u32,
             &exit_evt,
             &reset_evt,
@@ -420,9 +468,11 @@ impl Vm {
 
         let on_tty = unsafe { libc::isatty(libc::STDIN_FILENO as i32) } != 0;
 
-        let boot_vcpus = config.cpus.cpu_count;
+        let boot_vcpus = config.lock().unwrap().cpus.boot_vcpus;
+        let max_vcpus = config.lock().unwrap().cpus.max_vcpus;
         let cpu_manager = cpu::CpuManager::new(
             boot_vcpus,
+            max_vcpus,
             &device_manager,
             guest_memory.clone(),
             fd,
@@ -447,7 +497,7 @@ impl Vm {
     fn load_kernel(&mut self) -> Result<GuestAddress> {
         let mut cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
         cmdline
-            .insert_str(self.config.cmdline.args.clone())
+            .insert_str(self.config.lock().unwrap().cmdline.args.clone())
             .map_err(|_| Error::CmdLine)?;
         for entry in self.devices.cmdline_additions() {
             cmdline.insert_str(entry).map_err(|_| Error::CmdLine)?;
@@ -480,33 +530,19 @@ impl Vm {
             &cmdline_cstring,
         )
         .map_err(|_| Error::CmdLine)?;
-        let vcpu_count = self.config.cpus.cpu_count;
+        let boot_vcpus = self.cpu_manager.lock().unwrap().boot_vcpus();
+        let _max_vcpus = self.cpu_manager.lock().unwrap().max_vcpus();
 
         #[allow(unused_mut, unused_assignments)]
         let mut rsdp_addr: Option<GuestAddress> = None;
 
         #[cfg(feature = "acpi")]
         {
-            rsdp_addr = Some({
-                let end_of_range = GuestAddress((1 << get_host_cpu_phys_bits()) - 1);
-
-                let mem_end = mem.end_addr();
-                let start_of_device_area = if mem_end < arch::layout::MEM_32BIT_RESERVED_START {
-                    arch::layout::RAM_64BIT_START
-                } else {
-                    mem_end.unchecked_add(1)
-                };
-
-                use crate::config::ConsoleOutputMode;
-                crate::acpi::create_acpi_tables(
-                    &mem,
-                    vcpu_count,
-                    self.config.serial.mode != ConsoleOutputMode::Off,
-                    start_of_device_area,
-                    end_of_range,
-                    self.devices.virt_iommu(),
-                )
-            });
+            rsdp_addr = Some(crate::acpi::create_acpi_tables(
+                &mem,
+                &self.devices,
+                &self.cpu_manager,
+            ));
         }
 
         match entry_addr.setup_header {
@@ -515,7 +551,7 @@ impl Vm {
                     &mem,
                     arch::layout::CMDLINE_START,
                     cmdline_cstring.to_bytes().len() + 1,
-                    vcpu_count,
+                    boot_vcpus,
                     Some(hdr),
                     rsdp_addr,
                 )
@@ -534,7 +570,7 @@ impl Vm {
                     &mem,
                     arch::layout::CMDLINE_START,
                     cmdline_cstring.to_bytes().len() + 1,
-                    vcpu_count,
+                    boot_vcpus,
                     None,
                     rsdp_addr,
                 )
@@ -615,11 +651,36 @@ impl Vm {
         Ok(())
     }
 
-    fn os_signal_handler(signals: Signals, console_input_clone: Arc<Console>) {
+    pub fn resize(&mut self, desired_vcpus: u8) -> Result<()> {
+        self.cpu_manager
+            .lock()
+            .unwrap()
+            .resize(desired_vcpus)
+            .map_err(Error::CpuManager)?;
+        self.devices
+            .notify_hotplug(HotPlugNotificationType::CPUDevicesChanged)
+            .map_err(Error::DeviceManager)?;
+        self.config.lock().unwrap().cpus.boot_vcpus = desired_vcpus;
+        Ok(())
+    }
+
+    fn os_signal_handler(signals: Signals, console_input_clone: Arc<Console>, on_tty: bool) {
         for signal in signals.forever() {
-            if signal == SIGWINCH {
-                let (col, row) = get_win_size();
-                console_input_clone.update_console_size(col, row);
+            match signal {
+                SIGWINCH => {
+                    let (col, row) = get_win_size();
+                    console_input_clone.update_console_size(col, row);
+                }
+                SIGTERM | SIGINT => {
+                    if on_tty {
+                        io::stdin()
+                            .lock()
+                            .set_canon_mode()
+                            .expect("failed to restore terminal mode");
+                    }
+                    std::process::exit((signal != SIGTERM) as i32);
+                }
+                _ => (),
             }
         }
     }
@@ -643,15 +704,16 @@ impl Vm {
 
         if self.devices.console().input_enabled() {
             let console = self.devices.console().clone();
-            let signals = Signals::new(&[SIGWINCH]);
+            let signals = Signals::new(&[SIGWINCH, SIGINT, SIGTERM]);
             match signals {
                 Ok(signals) => {
                     self.signals = Some(signals.clone());
 
+                    let on_tty = self.on_tty;
                     self.threads.push(
                         thread::Builder::new()
                             .name("signal_handler".to_string())
-                            .spawn(move || Vm::os_signal_handler(signals, console))
+                            .spawn(move || Vm::os_signal_handler(signals, console, on_tty))
                             .map_err(Error::SignalHandlerSpawn)?,
                     );
                 }
@@ -695,7 +757,7 @@ impl Vm {
     }
 
     /// Gets a thread-safe reference counted pointer to the VM configuration.
-    pub fn get_config(&self) -> Arc<VmConfig> {
+    pub fn get_config(&self) -> Arc<Mutex<VmConfig>> {
         Arc::clone(&self.config)
     }
 

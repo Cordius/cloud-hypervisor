@@ -123,6 +123,22 @@ paths:
         405:
           description: The VM instance could not reboot because it is not booted.
 
+  /vm.resize:
+    put:
+      summary: Resize the VM
+      requestBody:
+        description: The target size for the VM
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VmResize'
+        required: true
+      responses:
+        204:
+          description: The VM instance was successfully resized.
+        404:
+          description: The VM instance could not be resized because it is not created.
+
 components:
   schemas:
 
@@ -207,10 +223,15 @@ components:
 
     CpuConfig:
       required:
-      - cpu_count
+      - boot_vcpus
+      - max_vcpus
       type: object
       properties:
-        cpu_count:
+        boot_vcpus:
+          minimum: 1
+          default: 1
+          type: integer
+        max_vcpus:
           minimum: 1
           default: 1
           type: integer
@@ -226,6 +247,9 @@ components:
           default: 512 MB
         file:
           type: string
+        mergeable:
+          type: boolean
+          default: false
 
     KernelConfig:
       required:
@@ -255,18 +279,17 @@ components:
           default: false
 
     NetConfig:
-      required:
-      - ip
-      - mask
-      - mac
       type: object
       properties:
         tap:
           type: string
+          default: ""
         ip:
           type: string
+          default: "192.168.249.1"
         mask:
           type: string
+          default: "255.255.255.0"
         mac:
           type: string
         iommu:
@@ -289,8 +312,6 @@ components:
       required:
       - tag
       - sock
-      - num_queues
-      - queue_size
       type: object
       properties:
         tag:
@@ -299,11 +320,14 @@ components:
           type: string
         num_queues:
           type: integer
+          default: 1
         queue_size:
           type: integer
+          default: 1024
         cache_size:
           type: integer
           format: int64
+          default: 8589934592
 
     PmemConfig:
       required:
@@ -317,6 +341,9 @@ components:
           type: integer
           format: int64
         iommu:
+          type: boolean
+          default: false
+        mergeable:
           type: boolean
           default: false
 
@@ -389,6 +416,7 @@ components:
       properties:
         cid:
           type: integer
+          format: int64
           minimum: 3
           description: Guest Vsock CID
         sock:
@@ -397,3 +425,13 @@ components:
         iommu:
           type: boolean
           default: false
+
+    VmResize:
+      required:
+      - desired_vcpus
+      type: object
+      properties:
+        desired_vcpus:
+          minimum: 1
+          default: 1
+          type: integer

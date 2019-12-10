@@ -76,7 +76,7 @@ LINUX_CUSTOM_DIR="linux-custom"
 if [ ! -f "$VMLINUX_IMAGE" ]; then
     SRCDIR=$PWD
     pushd $WORKLOADS_DIR
-    git clone --depth 1 "https://github.com/sboeuf/linux.git" -b "virtio-fs-virtio-iommu" $LINUX_CUSTOM_DIR
+    git clone --depth 1 "https://github.com/cloud-hypervisor/linux.git" -b "virtio-fs-virtio-iommu" $LINUX_CUSTOM_DIR
     pushd $LINUX_CUSTOM_DIR
     cp $SRCDIR/resources/linux-virtio-fs-virtio-iommu-config .config
     make bzImage -j `nproc`
@@ -145,12 +145,27 @@ sudo ip tuntap add vfio-tap1 mode tap
 sudo ip link set vfio-tap1 master vfio-br0
 sudo ip link set vfio-tap1 up
 
+sudo ip tuntap add vfio-tap2 mode tap
+sudo ip link set vfio-tap2 master vfio-br0
+sudo ip link set vfio-tap2 up
+
 cargo build --release
 sudo setcap cap_net_admin+ep target/release/cloud-hypervisor
 sudo setcap cap_net_admin+ep target/release/vhost_user_net
+sudo setcap cap_dac_override,cap_sys_admin+epi target/release/vhost_user_fs
 
 # We always copy a fresh version of our binary for our L2 guest.
 cp target/release/cloud-hypervisor $VFIO_DIR
+
+# Enable KSM with some reasonable parameters so that it won't take too long
+# for the memory to be merged between two processes.
+sudo bash -c "echo 10000 > /sys/kernel/mm/ksm/pages_to_scan"
+sudo bash -c "echo 10 > /sys/kernel/mm/ksm/sleep_millisecs"
+sudo bash -c "echo 1 > /sys/kernel/mm/ksm/run"
+
+# Ensure test binary has the same caps as the cloud-hypervisor one
+cargo test --no-run --features "integration_tests" -- --nocapture
+ls target/debug/deps/cloud_hypervisor-* | xargs -n 1 sudo setcap cap_net_admin+ep
 
 sudo adduser $USER kvm
 newgrp kvm << EOF
@@ -176,5 +191,6 @@ fi
 sudo ip link del vfio-br0
 sudo ip link del vfio-tap0
 sudo ip link del vfio-tap1
+sudo ip link del vfio-tap2
 
 exit $RES

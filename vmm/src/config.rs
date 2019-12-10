@@ -21,6 +21,10 @@ pub const DEFAULT_RNG_SOURCE: &str = "/dev/urandom";
 pub enum Error<'a> {
     /// Failed parsing cpus parameters.
     ParseCpusParams(std::num::ParseIntError),
+    /// Unexpected vCPU parameter
+    ParseCpusUnknownParam,
+    /// Max is less than boot
+    ParseCpusMaxLowerThanBoot,
     /// Failed parsing memory file parameter.
     ParseMemoryFileParam,
     /// Failed parsing kernel parameters.
@@ -75,8 +79,8 @@ pub enum Error<'a> {
     ParseVsockSockParam,
     /// Missing kernel configuration
     ValidateMissingKernelConfig,
-    /// Failed parsing iommu parameter for the device.
-    ParseDeviceIommu,
+    /// Failed parsing generic on|off parameter.
+    ParseOnOff,
 }
 pub type Result<'a, T> = result::Result<T, Error<'a>>;
 
@@ -116,12 +120,12 @@ fn parse_size(size: &str) -> Result<u64> {
     Ok(res << shift)
 }
 
-fn parse_iommu(iommu: &str) -> Result<bool> {
-    if !iommu.is_empty() {
-        let res = match iommu {
+fn parse_on_off(param: &str) -> Result<bool> {
+    if !param.is_empty() {
+        let res = match param {
             "on" => true,
             "off" => false,
-            _ => return Err(Error::ParseDeviceIommu),
+            _ => return Err(Error::ParseOnOff),
         };
 
         Ok(res)
@@ -132,21 +136,59 @@ fn parse_iommu(iommu: &str) -> Result<bool> {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CpusConfig {
-    pub cpu_count: u8,
+    pub boot_vcpus: u8,
+    pub max_vcpus: u8,
 }
 
 impl CpusConfig {
     pub fn parse(cpus: &str) -> Result<Self> {
-        Ok(CpusConfig {
-            cpu_count: cpus.parse().map_err(Error::ParseCpusParams)?,
-        })
+        if let Ok(legacy_vcpu_count) = cpus.parse::<u8>() {
+            error!("Using deprecated vCPU syntax. Use --cpus boot=<boot_vcpus>[,max=<max_vcpus]");
+            Ok(CpusConfig {
+                boot_vcpus: legacy_vcpu_count,
+                max_vcpus: legacy_vcpu_count,
+            })
+        } else {
+            // Split the parameters based on the comma delimiter
+            let params_list: Vec<&str> = cpus.split(',').collect();
+
+            let mut boot_str: &str = "";
+            let mut max_str: &str = "";
+
+            for param in params_list.iter() {
+                if param.starts_with("boot=") {
+                    boot_str = &param["boot=".len()..];
+                } else if param.starts_with("max=") {
+                    max_str = &param["max=".len()..];
+                } else {
+                    return Err(Error::ParseCpusUnknownParam);
+                }
+            }
+
+            let boot_vcpus: u8 = boot_str.parse().map_err(Error::ParseCpusParams)?;
+            let max_vcpus = if max_str != "" {
+                max_str.parse().map_err(Error::ParseCpusParams)?
+            } else {
+                boot_vcpus
+            };
+
+            if max_vcpus < boot_vcpus {
+                return Err(Error::ParseCpusMaxLowerThanBoot);
+            }
+
+            Ok(CpusConfig {
+                boot_vcpus,
+                max_vcpus,
+            })
+        }
     }
 }
 
 impl Default for CpusConfig {
     fn default() -> Self {
         CpusConfig {
-            cpu_count: DEFAULT_VCPUS,
+            boot_vcpus: DEFAULT_VCPUS,
+            max_vcpus: DEFAULT_VCPUS,
         }
     }
 }
@@ -155,6 +197,8 @@ impl Default for CpusConfig {
 pub struct MemoryConfig {
     pub size: u64,
     pub file: Option<PathBuf>,
+    #[serde(default)]
+    pub mergeable: bool,
 }
 
 impl MemoryConfig {
@@ -164,6 +208,7 @@ impl MemoryConfig {
 
         let mut size_str: &str = "";
         let mut file_str: &str = "";
+        let mut mergeable_str: &str = "";
         let mut backed = false;
 
         for param in params_list.iter() {
@@ -172,6 +217,8 @@ impl MemoryConfig {
             } else if param.starts_with("file=") {
                 backed = true;
                 file_str = &param[5..];
+            } else if param.starts_with("mergeable=") {
+                mergeable_str = &param[10..];
             }
         }
 
@@ -188,6 +235,7 @@ impl MemoryConfig {
         Ok(MemoryConfig {
             size: parse_size(size_str)?,
             file,
+            mergeable: parse_on_off(mergeable_str)?,
         })
     }
 }
@@ -197,6 +245,7 @@ impl Default for MemoryConfig {
         MemoryConfig {
             size: DEFAULT_MEMORY_MB << 20,
             file: None,
+            mergeable: false,
         }
     }
 }
@@ -246,19 +295,39 @@ impl DiskConfig {
 
         Ok(DiskConfig {
             path: PathBuf::from(path_str),
-            iommu: parse_iommu(iommu_str)?,
+            iommu: parse_on_off(iommu_str)?,
         })
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NetConfig {
+    #[serde(default = "default_netconfig_tap")]
     pub tap: Option<String>,
+    #[serde(default = "default_netconfig_ip")]
     pub ip: Ipv4Addr,
+    #[serde(default = "default_netconfig_mask")]
     pub mask: Ipv4Addr,
+    #[serde(default = "default_netconfig_mac")]
     pub mac: MacAddr,
     #[serde(default)]
     pub iommu: bool,
+}
+
+fn default_netconfig_tap() -> Option<String> {
+    None
+}
+
+fn default_netconfig_ip() -> Ipv4Addr {
+    Ipv4Addr::new(192, 168, 249, 1)
+}
+
+fn default_netconfig_mask() -> Ipv4Addr {
+    Ipv4Addr::new(255, 255, 255, 0)
+}
+
+fn default_netconfig_mac() -> MacAddr {
+    MacAddr::local_random()
 }
 
 impl NetConfig {
@@ -286,11 +355,11 @@ impl NetConfig {
             }
         }
 
-        let mut tap: Option<String> = None;
-        let mut ip: Ipv4Addr = Ipv4Addr::new(192, 168, 249, 1);
-        let mut mask: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
-        let mut mac: MacAddr = MacAddr::local_random();
-        let iommu = parse_iommu(iommu_str)?;
+        let mut tap: Option<String> = default_netconfig_tap();
+        let mut ip: Ipv4Addr = default_netconfig_ip();
+        let mut mask: Ipv4Addr = default_netconfig_mask();
+        let mut mac: MacAddr = default_netconfig_mac();
+        let iommu = parse_on_off(iommu_str)?;
 
         if !tap_str.is_empty() {
             tap = Some(tap_str.to_string());
@@ -340,7 +409,7 @@ impl RngConfig {
 
         Ok(RngConfig {
             src: PathBuf::from(src_str),
-            iommu: parse_iommu(iommu_str)?,
+            iommu: parse_on_off(iommu_str)?,
         })
     }
 }
@@ -358,9 +427,24 @@ impl Default for RngConfig {
 pub struct FsConfig {
     pub tag: String,
     pub sock: PathBuf,
+    #[serde(default = "default_fsconfig_num_queues")]
     pub num_queues: usize,
+    #[serde(default = "default_fsconfig_queue_size")]
     pub queue_size: u16,
+    #[serde(default = "default_fsconfig_cache_size")]
     pub cache_size: Option<u64>,
+}
+
+fn default_fsconfig_num_queues() -> usize {
+    1
+}
+
+fn default_fsconfig_queue_size() -> u16 {
+    1024
+}
+
+fn default_fsconfig_cache_size() -> Option<u64> {
+    Some(0x0002_0000_0000)
 }
 
 impl FsConfig {
@@ -391,11 +475,11 @@ impl FsConfig {
             }
         }
 
-        let mut num_queues: usize = 1;
-        let mut queue_size: u16 = 1024;
+        let mut num_queues: usize = default_fsconfig_num_queues();
+        let mut queue_size: u16 = default_fsconfig_queue_size();
         let mut dax: bool = true;
         // Default cache size set to 8Gib.
-        let mut cache_size: Option<u64> = Some(0x0002_0000_0000);
+        let mut cache_size: Option<u64> = default_fsconfig_cache_size();
 
         if tag.is_empty() {
             return Err(Error::ParseFsTagParam);
@@ -448,6 +532,8 @@ pub struct PmemConfig {
     pub size: u64,
     #[serde(default)]
     pub iommu: bool,
+    #[serde(default)]
+    pub mergeable: bool,
 }
 
 impl PmemConfig {
@@ -458,6 +544,7 @@ impl PmemConfig {
         let mut file_str: &str = "";
         let mut size_str: &str = "";
         let mut iommu_str: &str = "";
+        let mut mergeable_str: &str = "";
 
         for param in params_list.iter() {
             if param.starts_with("file=") {
@@ -466,6 +553,8 @@ impl PmemConfig {
                 size_str = &param[5..];
             } else if param.starts_with("iommu=") {
                 iommu_str = &param[6..];
+            } else if param.starts_with("mergeable=") {
+                mergeable_str = &param[10..];
             }
         }
 
@@ -476,7 +565,8 @@ impl PmemConfig {
         Ok(PmemConfig {
             file: PathBuf::from(file_str),
             size: parse_size(size_str)?,
-            iommu: parse_iommu(iommu_str)?,
+            iommu: parse_on_off(iommu_str)?,
+            mergeable: parse_on_off(mergeable_str)?,
         })
     }
 }
@@ -546,7 +636,7 @@ impl ConsoleConfig {
         Ok(Self {
             mode,
             file,
-            iommu: parse_iommu(iommu_str)?,
+            iommu: parse_on_off(iommu_str)?,
         })
     }
 
@@ -592,7 +682,7 @@ impl DeviceConfig {
 
         Ok(DeviceConfig {
             path: PathBuf::from(path_str),
-            iommu: parse_iommu(iommu_str)?,
+            iommu: parse_on_off(iommu_str)?,
         })
     }
 }
@@ -697,7 +787,7 @@ impl VsockConfig {
         Ok(VsockConfig {
             cid: cid_str.parse::<u64>().map_err(Error::ParseVsockCidParam)?,
             sock: PathBuf::from(sock_str),
-            iommu: parse_iommu(iommu_str)?,
+            iommu: parse_on_off(iommu_str)?,
         })
     }
 }
